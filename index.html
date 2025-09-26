@@ -33,11 +33,6 @@
   <div class="card">
     <div class="row">
       <div class="col">
-        <label>API base URL</label>
-        <input id="baseUrl" style="width:100%" value="https://YOUR_SUBDOMAIN.workers.dev">
-        <small class="muted">e.g. https://dht11-api.yourname.workers.dev</small>
-      </div>
-      <div class="col">
         <label>Device ID</label>
         <input id="deviceId" style="width:100%" value="esp32-01">
       </div>
@@ -126,6 +121,21 @@
 const $ = id => document.getElementById(id);
 let timer=null, tempChart, humChart, cachedRows=[];
 
+// ---- Persist UI choices so you don't retype them
+(function initSaved() {
+  const fields = ['deviceId','rangeSel','bucketSel','limitSel','intervalSel'];
+  for (const id of fields) {
+    const saved = localStorage.getItem(id);
+    if (saved !== null && $(id)) $(id).value = saved;
+  }
+})();
+['deviceId','rangeSel','bucketSel','limitSel','intervalSel'].forEach(id=>{
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener('change', ()=> localStorage.setItem(id, el.value.trim()));
+});
+
+// ---- Range helpers
 function parseRange(str){
   const now = Date.now();
   const n = Number(str.slice(0, -1));
@@ -136,104 +146,71 @@ function parseRange(str){
   if(unit === 'd') ms = n*24*60*60*1000;
   return {from: now - ms, to: now};
 }
-
 function floorToBucket(ts, bucket){
   const d = new Date(ts);
-  if(bucket === 'minute'){
-    d.setSeconds(0,0);
-  } else if(bucket === 'hour'){
-    d.setMinutes(0,0,0);
-  } else if(bucket === 'day'){
-    d.setHours(0,0,0,0);
-  } else {
-    // auto: leave as-is (no bucketing)
-  }
+  if(bucket === 'minute'){ d.setSeconds(0,0); }
+  else if(bucket === 'hour'){ d.setMinutes(0,0,0); }
+  else if(bucket === 'day'){ d.setHours(0,0,0,0); }
   return d.getTime();
 }
-
 function chooseAutoBucket(rangeStr){
-  // heuristics: <=2h -> minute; <=24h -> hour; otherwise day
   if(rangeStr.endsWith('m') || rangeStr === '2h') return 'minute';
   if(rangeStr === '6h' || rangeStr === '24h') return 'hour';
   return 'day';
 }
-
 function aggregate(rows, rangeStr, bucketSel){
-  // filter by time window
-  const {from, to} = parseRange(rangeStr);
+  const {from} = parseRange(rangeStr);
   const filtered = rows.filter(r => new Date(r.ts).getTime() >= from);
-
   const bucket = bucketSel === 'auto' ? chooseAutoBucket(rangeStr) : bucketSel;
   if(bucket === 'auto'){
     return filtered.map(r => ({ x:new Date(r.ts).getTime(), t:+r.temp_c, h:+r.humidity }));
   }
-
-  // group by floored ts
   const map = new Map();
   for(const r of filtered){
     const key = floorToBucket(r.ts, bucket);
     const prev = map.get(key) || {sumT:0, sumH:0, n:0};
-    prev.sumT += +r.temp_c;
-    prev.sumH += +r.humidity;
-    prev.n += 1;
+    prev.sumT += +r.temp_c; prev.sumH += +r.humidity; prev.n += 1;
     map.set(key, prev);
   }
-  // to array sorted by time
-  const points = Array.from(map.entries()).sort((a,b)=>a[0]-b[0]).map(([k,v])=>({
-    x: Number(k),
-    t: v.sumT / v.n,
-    h: v.sumH / v.n
+  return Array.from(map.entries()).sort((a,b)=>a[0]-b[0]).map(([k,v])=>({
+    x: Number(k), t: v.sumT/v.n, h: v.sumH/v.n
   }));
-  return points;
 }
 
+// ---- Charts
 function buildCharts(){
   const common = {
     parsing:false, animation:false,
     plugins:{legend:{display:true}},
-    scales:{
-      x:{type:'time', time:{tooltipFormat:'PPpp'}},
-      y:{beginAtZero:false}
-    }
+    scales:{ x:{type:'time', time:{tooltipFormat:'PPpp'}}, y:{beginAtZero:false} }
   };
   tempChart = new Chart($('tempChart').getContext('2d'), {
-    type:'line',
-    data:{datasets:[{label:'Temp °C', data:[]}]},
-    options: common
+    type:'line', data:{datasets:[{label:'Temp °C', data:[]}]}, options: common
   });
   humChart = new Chart($('humChart').getContext('2d'), {
-    type:'line',
-    data:{datasets:[{label:'Humidity %', data:[]}]},
+    type:'line', data:{datasets:[{label:'Humidity %', data:[]}]},
     options:{...common, scales:{ x:{type:'time', time:{tooltipFormat:'PPpp'}}, y:{beginAtZero:true, max:100} }}
   });
 }
-
 function updateChartsFromCached(){
   const rangeStr = $('rangeSel').value;
   const bucketSel = $('bucketSel').value;
   const agg = aggregate(cachedRows, rangeStr, bucketSel);
-  // map to chart.js points
   const tpts = agg.map(p=>({x:p.x, y:Number(p.t)}));
   const hpts = agg.map(p=>({x:p.x, y:Number(p.h)}));
   tempChart.data.datasets[0].data = tpts;
   humChart.data.datasets[0].data = hpts;
-
-  // set unit hint to improve tick labeling
   const unit = bucketSel === 'auto' ? chooseAutoBucket(rangeStr) : bucketSel;
-  const xConfT = tempChart.options.scales.x;
-  const xConfH = humChart.options.scales.x;
-  xConfT.time.unit = unit === 'minute' ? 'minute' : unit === 'hour' ? 'hour' : 'day';
-  xConfH.time.unit = xConfT.time.unit;
-
-  tempChart.update();
-  humChart.update();
+  tempChart.options.scales.x.time.unit = unit === 'minute' ? 'minute' : unit === 'hour' ? 'hour' : 'day';
+  humChart.options.scales.x.time.unit = tempChart.options.scales.x.time.unit;
+  tempChart.update(); humChart.update();
 }
 
+// ---- API (relative to your Pages domain)
 async function loadLatest(){
-  const base=$('baseUrl').value.trim().replace(/\/+$/,'');
-  const deviceId=$('deviceId').value.trim();
-  const r=await fetch(`${base}/api/latest?deviceId=${encodeURIComponent(deviceId)}`);
-  const data=await r.json();
+  const deviceId = $('deviceId').value.trim();
+  const r = await fetch(`/api/latest?deviceId=${encodeURIComponent(deviceId)}`);
+  const data = await r.json();
   if(data.latest){
     $('tempVal').textContent=Number(data.latest.temp_c).toFixed(1);
     $('humVal').textContent=Number(data.latest.humidity).toFixed(1);
@@ -244,16 +221,13 @@ async function loadLatest(){
     $('tempTs').textContent='No data yet'; $('humTs').textContent='No data yet';
   }
 }
-
 async function loadList(){
-  const base=$('baseUrl').value.trim().replace(/\/+$/,'');
-  const deviceId=$('deviceId').value.trim();
-  const limit=Number($('limitSel').value);
-  const r=await fetch(`${base}/api/readings?deviceId=${encodeURIComponent(deviceId)}&limit=${limit}`);
-  const data=await r.json();
+  const deviceId = $('deviceId').value.trim();
+  const limit = Number($('limitSel').value);
+  const r = await fetch(`/api/readings?deviceId=${encodeURIComponent(deviceId)}&limit=${limit}`);
+  const data = await r.json();
   const rows = data.rows || [];
   cachedRows = rows;
-
   $('rows').innerHTML = rows.map(r=>`
     <tr>
       <td>${new Date(r.ts).toLocaleString()}</td>
@@ -261,22 +235,21 @@ async function loadList(){
       <td>${Number(r.humidity).toFixed(1)}</td>
     </tr>
   `).join('');
-
   updateChartsFromCached();
 }
 
+// ---- Auto-refresh
 function setIntervalFromSelect(){
   const s=Number($('intervalSel').value);
   if(timer) clearInterval(timer);
   if(s>0) timer=setInterval(()=>{loadLatest();loadList();}, s*1000);
 }
 
-$('downloadCsv').addEventListener('click', ()=>{
+// ---- CSV
+document.getElementById('downloadCsv').addEventListener('click', ()=>{
   const rows = cachedRows.slice().reverse();
   let csv="timestamp,temp_c,humidity\n";
-  rows.forEach(r=>{
-    csv+=`${new Date(r.ts).toISOString()},${Number(r.temp_c)},${Number(r.humidity)}\n`;
-  });
+  rows.forEach(r=>{ csv+=`${new Date(r.ts).toISOString()},${Number(r.temp_c)},${Number(r.humidity)}\n`; });
   const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
@@ -284,15 +257,14 @@ $('downloadCsv').addEventListener('click', ()=>{
   a.click();
 });
 
-// Re-render on control changes
+// ---- Wire up UI
 ['rangeSel','bucketSel','limitSel'].forEach(id=>{
-  $(id).addEventListener('change', ()=>{
-    if(id==='limitSel'){ loadList(); } else { updateChartsFromCached(); }
-  });
+  $(id).addEventListener('change', ()=>{ id==='limitSel' ? loadList() : updateChartsFromCached(); });
 });
 $('refresh').addEventListener('click', ()=>{ loadLatest(); loadList(); });
 $('intervalSel').addEventListener('change', setIntervalFromSelect);
 
+// Init
 buildCharts();
 loadLatest().then(loadList).then(setIntervalFromSelect);
 </script>
