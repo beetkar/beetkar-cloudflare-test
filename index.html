@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DHT11 Live Readings (Charts)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    h1 { margin-top: 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #eee; text-align: left; font-variant-numeric: tabular-nums; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .col { flex: 1 1 320px; }
+    .val { font-size: 2.6rem; font-weight: 700; }
+    .muted { color: #6b7280; }
+    canvas { width: 100%; height: 300px; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+</head>
+<body>
+  <h1>DHT11 Live Readings (Cloudflare)</h1>
+  <div class="card">
+    <div class="row">
+      <div class="col">
+        <label>API base URL:</label>
+        <input id="baseUrl" style="width: 100%;" value="https://YOUR_SUBDOMAIN.workers.dev">
+      </div>
+      <div class="col">
+        <label>Device ID:</label>
+        <input id="deviceId" style="width: 100%;" value="esp32-01">
+      </div>
+      <div class="col" style="align-self: end; display:flex; gap:8px;">
+        <button id="refresh">Refresh</button>
+        <button id="downloadCsv">Download CSV</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card col">
+      <div class="muted">Temperature (°C)</div>
+      <div id="tempVal" class="val">--</div>
+      <div id="tempTs" class="muted">—</div>
+    </div>
+    <div class="card col">
+      <div class="muted">Humidity (%)</div>
+      <div id="humVal" class="val">--</div>
+      <div id="humTs" class="muted">—</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="col"><strong>Recent readings</strong></div>
+      <div class="col" style="text-align:right">
+        <label>Auto refresh</label>
+        <select id="intervalSel">
+          <option value="0">off</option>
+          <option value="5">5s</option>
+          <option value="10" selected>10s</option>
+          <option value="30">30s</option>
+          <option value="60">60s</option>
+        </select>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>Time</th><th>Temp (°C)</th><th>Humidity (%)</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <strong>Charts</strong>
+    <div class="row">
+      <div class="col"><canvas id="tempChart"></canvas></div>
+      <div class="col"><canvas id="humChart"></canvas></div>
+    </div>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+let timer=null, tempChart, humChart, cachedRows=[];
+
+function buildCharts(){
+  tempChart = new Chart($('tempChart').getContext('2d'), {
+    type:'line',
+    data:{datasets:[{label:'Temp °C', data:[]}]},
+    options:{scales:{x:{type:'time'},y:{beginAtZero:false}}}
+  });
+  humChart = new Chart($('humChart').getContext('2d'), {
+    type:'line',
+    data:{datasets:[{label:'Humidity %', data:[]}]},
+    options:{scales:{x:{type:'time'},y:{beginAtZero:true,max:100}}}
+  });
+}
+
+function updateCharts(rows){
+  const tempData=rows.slice().reverse().map(r=>({x:new Date(r.ts), y:r.temp_c}));
+  const humData=rows.slice().reverse().map(r=>({x:new Date(r.ts), y:r.humidity}));
+  tempChart.data.datasets[0].data=tempData;
+  humChart.data.datasets[0].data=humData;
+  tempChart.update(); humChart.update();
+}
+
+async function loadLatest(){
+  const base=$('baseUrl').value.trim().replace(/\/+$/,'');
+  const deviceId=$('deviceId').value.trim();
+  const r=await fetch(`${base}/api/latest?deviceId=${encodeURIComponent(deviceId)}`);
+  const data=await r.json();
+  if(data.latest){
+    $('tempVal').textContent=Number(data.latest.temp_c).toFixed(1);
+    $('humVal').textContent=Number(data.latest.humidity).toFixed(1);
+    $('tempTs').textContent=new Date(data.latest.ts).toLocaleString();
+    $('humTs').textContent=new Date(data.latest.ts).toLocaleString();
+  }
+}
+
+async function loadList(){
+  const base=$('baseUrl').value.trim().replace(/\/+$/,'');
+  const deviceId=$('deviceId').value.trim();
+  const r=await fetch(`${base}/api/readings?deviceId=${encodeURIComponent(deviceId)}&limit=200`);
+  const data=await r.json();
+  cachedRows=data.rows||[];
+  $('rows').innerHTML=cachedRows.map(r=>`
+    <tr><td>${new Date(r.ts).toLocaleString()}</td>
+    <td>${r.temp_c.toFixed(1)}</td>
+    <td>${r.humidity.toFixed(1)}</td></tr>`).join('');
+  updateCharts(cachedRows);
+}
+
+function setIntervalFromSelect(){
+  const s=Number($('intervalSel').value);
+  if(timer) clearInterval(timer);
+  if(s>0) timer=setInterval(()=>{loadLatest();loadList();}, s*1000);
+}
+
+$('refresh').addEventListener('click',()=>{loadLatest();loadList();});
+$('intervalSel').addEventListener('change',setIntervalFromSelect);
+$('downloadCsv').addEventListener('click',()=>{
+  let csv="timestamp,temp_c,humidity\n";
+  cachedRows.slice().reverse().forEach(r=>{
+    csv+=`${new Date(r.ts).toISOString()},${r.temp_c},${r.humidity}\n`;
+  });
+  const blob=new Blob([csv],{type:'text/csv'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`readings_${$('deviceId').value}_${Date.now()}.csv`;
+  a.click();
+});
+
+buildCharts();
+loadLatest().then(loadList).then(setIntervalFromSelect);
+</script>
+</body>
+</html>
